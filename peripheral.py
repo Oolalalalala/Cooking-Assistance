@@ -36,7 +36,7 @@ class Microphone:
         # TODO: Continuously detect for audio in the background (don't block the thread, spin up a thread or process)
         pass
 
-    def has_text(self, text) -> str:
+    def has_text(self) -> bool:
         # TODO: Check if there is text detected by the microphone
         pass
 
