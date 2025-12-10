@@ -49,12 +49,12 @@ class CookingAssistant:
                 name="RECIPE_CONFIRMATION",
                 description="Negotiate with the human. If the human agrees to the dish, move to INSTRUCTION_OVERVIEW. If no, propose another dish.",
                 valid_next_states=["RECIPE_CONFIRMATION", "INSTRUCTION_OVERVIEW"],
-                requires_image=False
+                requires_image=True
             ),
             "INSTRUCTION_OVERVIEW": State(
                 name="INSTRUCTION_OVERVIEW",
-                description="Give a high-level overview of the instructions.",
-                valid_next_states=["ACTIVE_COOKING"],
+                description="Give a high-level overview of the instructions. If the user agrees to start, move to ACTIVE_COOKING",
+                valid_next_states=["INSTRUCTION_OVERVIEW", "ACTIVE_COOKING"],
                 requires_image=False
             ),
             "ACTIVE_COOKING": State(
@@ -165,24 +165,32 @@ class CookingAssistant:
 
         CRITICAL TRANSITION RULE:
         You generally must NOT transition to a new State or a new Cooking Step unless the user explicitly confirms (e.g., says 'yes', 'okay', 'ready', 'next').
-        - If visual monitoring shows a step is done, ASK: "It looks like you are done. Are you ready for the next step?"
-        - Do NOT simply output the next instruction until they say "Yes".
 
         INSTRUCTIONS:
         
         1. SETUP PHASE (States: START -> INGREDIENT_SCAN -> RECIPE_CONFIRMATION -> INSTRUCTION_OVERVIEW):
-           - Propose dishes. Wait for user agreement ("Yes, that sounds good") before moving to next state.
+           - Propose dishes. Wait for user agreement before moving to next state.
            - Give overview. Ask "Are you ready to start?" before moving to ACTIVE_COOKING.
 
         2. ACTIVE COOKING PHASE (State: ACTIVE_COOKING):
-           - Guide user step-by-step.
-           - CASE A (User asks question): Answer it.
-           - CASE B (User is working, everything looks good): Say nothing.
-           - CASE C (User finished step visually): Ask user if they are ready for the next step.
-           - CASE D (User confirms "Yes/Ready"): Explain the NEXT step. Set status="INSTRUCTION_UPDATE".
-           - CASE E (User made mistake): Explain how to fix it.
-           - CASE F (Recipe Done): Ask if they are finished. If yes, transition to "FINISHED".
-        
+           
+           ### SUB-CATEGORY 1: IF 'user_voice' IS EMPTY (Visual Monitoring Mode)
+           1. CASE (User is working, everything looks good): 
+              CRITICAL: SAY NOTHING. Output status "MONITORING_NO_CHANGE" and empty speech_output.
+           2. CASE (User finished step visually): 
+              Ask: "It looks like you are done. Are you ready for the next step?"
+           3. CASE (User made visual mistake): 
+              Explain the error clearly and how to fix it immediately.
+           4. CASE (Recipe Visually Done): 
+              Ask: "It looks like the recipe is finished. Shall we end the session?"
+
+           ### SUB-CATEGORY 2: IF 'user_voice' IS NOT EMPTY (Interaction Mode)
+           1. CASE (User asks question): 
+              Answer the specific question regarding the cooking process.
+           2. CASE (User confirms "Yes/Ready" to a prompt): 
+              Explain the NEXT step. Set status="INSTRUCTION_UPDATE".
+              (If responding to Recipe Done, transition next_state to "FINISHED").
+
         3. GENERAL RULES:
            - "timer_name/duration": If user starts a timed task, provide details. Confirm verbally.
         """
