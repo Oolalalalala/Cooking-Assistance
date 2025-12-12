@@ -83,16 +83,15 @@ class CookingAssistant:
 
     def speak(self, text):
         print(f"🤖 AI: {text}")
-        self.speaker.play_text(text)
         while self.speaker.is_playing():
             time.sleep(0.1)
+        self.speaker.play_text(text)
 
     def listen(self, timeout=5):
         """
         Polls Microphone.has_text() for a duration.
         Returns text string or empty string.
         """
-        # print(f"🎤 Listening (timeout: {timeout}s)...") # Reduced log spam
         start_time = time.time()
         while time.time() - start_time < timeout:
             if self.mic.has_text():
@@ -122,14 +121,19 @@ class CookingAssistant:
             try:
                 content_json = json.loads(content)
                 status = content_json.get("status", "")
+                # Get speech output to ensure it is empty
+                speech = content_json.get("speech_output", "")
 
-                if status == "MONITORING_NO_CHANGE" and len(self.history) >= 2:
+                # Modified Condition: Only merge if status is MONITORING *AND* speech is empty
+                if status == "MONITORING_NO_CHANGE" and not speech and len(self.history) >= 2:
                     prev_assistant_msg = self.history[-2] 
                     if prev_assistant_msg["role"] == "assistant":
                         try:
                             prev_json = json.loads(prev_assistant_msg["content"])
                             prev_status = prev_json.get("status", "")
                             
+                            # Check if previous was also a monitoring state (implies empty speech usually)
+                            # or if it was already a merged monitoring block
                             if prev_status == "MONITORING_NO_CHANGE" or "MONITORING_NO_CHANGE *" in prev_json.get("debug_note", ""):
                                 count = prev_json.get("monitor_count", 1) + 1
                                 content_json["monitor_count"] = count
@@ -152,6 +156,7 @@ class CookingAssistant:
     def call_gpt_api(self, user_voice, image_base64=None):
         current_state_obj = self.states[self.current_state_name]
 
+        # --- SYSTEM PROMPT (UNCHANGED) ---
         system_prompt = """
         You are a Smart Cooking Assistant.
 
@@ -171,7 +176,13 @@ class CookingAssistant:
         ### STATE TRANSITION ENFORCEMENT (HIGHEST PRIORITY) ###
         1. You are a State Machine. You are currently in: '{current_state}'.
         2. You MUST select 'next_state' ONLY from this list: {valid_next_states}.
-        3. DO NOT invent new states. DO NOT remain in the current state if the user has satisfied the condition to move forward.
+        3. DO NOT invent new states. DO NOT switch state if the user did not agree.
+
+        ### VISUAL REASONING PROTOCOL ###
+        When asked to judge the state of food (e.g., cut size, doneness):
+        1. FIRST, describe strictly what you see (e.g., "I see a whole fillet," or "I see large chunks").
+        2. THEN, compare it to the goal state.
+        3. ONLY THEN give your verdict.
 
         INSTRUCTIONS:
         
@@ -204,7 +215,13 @@ class CookingAssistant:
            2. CASE (User explicitly confirms COMPLETION or asks for NEXT):
               (e.g., "I'm done", "Next step", "What's next?", "Ready").
               ACTION: Explain the NEXT step. Set status="INSTRUCTION_UPDATE".
-           3. CASE (User asks question): 
+           3. CASE (User asks visual judgment question): 
+              (e.g. "Is it small enough?", "Is this done?").
+              ACTION: You must STOP and look at the image.
+              - If the food looks exactly the same as the raw ingredient: Say "It doesn't look diced yet. It looks like a whole piece."
+              - If you can't see it clearly: Say "I can't see the salmon clearly. Can you bring it closer?"
+              - Only say "Yes" if you clearly see distinct small pieces.
+           4. CASE (User asks general question):
               Answer the question. Remain on current step.
 
         3. GENERAL RULES:
@@ -215,6 +232,7 @@ class CookingAssistant:
             "current_state": current_state_obj.name,
             "goal": current_state_obj.description,
             "valid_next_states": current_state_obj.valid_next_states,
+            "timestamp": datetime.now().isoformat(),  # --- MODIFICATION: Added Timestamp ---
             "user_voice": user_voice,
             "image_provided": image_base64 is not None
         }
@@ -268,7 +286,7 @@ class CookingAssistant:
         return None
 
     def run(self):
-        self.speak("System starting.")
+        self.speak("系統啟動中 (System starting)")
 
         while True:
             state_obj = self.states[self.current_state_name]
@@ -288,43 +306,38 @@ class CookingAssistant:
                     print(f"⏰ {timer_notification}")
                     user_voice = timer_notification
                 
-                # 2. Capture Image (Always monitor in active mode)
+                # 2. Listen (Wait up to 5s for voice)
+                if not user_voice:
+                    user_voice = self.listen(timeout=5)
+
+                # 3. Capture Image (Fresh!)
                 if state_obj.requires_image and not timer_notification:
                     print("📸 Monitoring Capture...")
                     image_data = self.capture_image()
-                
-                # 3. Listen (Non-blocking / Short timeout)
-                # If we already have a timer interrupt, we skip listening to prioritize the alert
-                if not user_voice:
-                    user_voice = self.listen(timeout=5)
 
             else:
                 # === REACTIVE MODE (Wait for Input) ===
                 print("🎤 Waiting for audio...")
                 
-                # Loop until we get Voice OR a Timer Interrupt
                 while True:
                     # Priority 1: Check Timers
                     timer_notification = self.check_timers()
                     if timer_notification:
                         print(f"⏰ {timer_notification}")
                         user_voice = timer_notification
-                        break # Exit wait loop to process timer
+                        break 
                     
                     # Priority 2: Check Voice
                     voice_input = self.listen(timeout=5)
                     if voice_input:
                         user_voice = voice_input
-                        break # Exit wait loop to process voice
+                        break 
                 
-                # Once we have input (Voice or Timer), capture image if required
                 if state_obj.requires_image and not timer_notification:
                     print("📸 Reactive Capture...")
                     image_data = self.capture_image()
 
             # --- CALL API ---
-            
-            # Sanity check: If we are in START and somehow got here with nothing (shouldn't happen due to wait loop), skip
             if not user_voice and not image_data and self.current_state_name == "START":
                 continue 
 
@@ -355,11 +368,6 @@ class CookingAssistant:
             elif next_state == "FINISHED":
                 print("Cooking Session Complete.")
                 break
-            
-            # Delay only applies to ACTIVE_COOKING monitoring loops
-            if self.current_state_name == "ACTIVE_COOKING" and status == "MONITORING_NO_CHANGE":
-                print("... Waiting 5 seconds ...")
-                time.sleep(5)
 
         self.camera.release()
 

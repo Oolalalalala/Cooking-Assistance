@@ -7,6 +7,7 @@ import speech_recognition as sr
 import os
 import sys
 from contextlib import contextmanager
+import re, tempfile, subprocess
 
 # --- CAMERA CLASS ---
 class Camera:
@@ -24,70 +25,147 @@ class Camera:
             print(f"[Mock Camera] Error: '{self.image_path}' not found. Please place an image file in the directory.")
             return None
 
-# --- SPEAKER CLASS ---
 class Speaker:
-    def __init__(self, microphone=None):
+    def __init__(
+        self,
+        microphone=None,
+        # Adjust these paths to where you actually installed Piper
+        piper_bin=os.path.expanduser("~/.local/bin/piper"),
+        model_path=os.path.expanduser("~/piper/models/zh_CN-huayan-medium.onnx"),
+        sentence_silence=0.3,
+        volume=0.7,
+        use_queue=True,
+    ):
         self.microphone = microphone
+        self._lock = threading.Lock()
+        self._is_playing = False
+
+        self.piper_bin = piper_bin
+        self.model_path = model_path
+        self.sentence_silence = sentence_silence
+        self.volume = volume
+
+        # Sanity checks for Piper paths
+        if not os.path.exists(self.piper_bin):
+            print(f"⚠️ Warning: Piper binary not found at {self.piper_bin}")
+        if not os.path.exists(self.model_path):
+            print(f"⚠️ Warning: Model not found at {self.model_path}")
+
+        self._use_queue = use_queue
         self._queue = queue.Queue()
-        self._is_speaking_event = threading.Event()  # Thread-safe flag
         
         # Start the persistent worker thread
-        self._thread = threading.Thread(target=self._play_worker, daemon=True)
-        self._thread.start()
+        if use_queue:
+            self._thread = threading.Thread(target=self._play_worker, daemon=True)
+            self._thread.start()
 
-    def _play_worker(self):
-        """
-        Initializes the engine on this thread and waits for text to speak.
-        """
-        # Initialize engine once on the worker thread
-        engine = pyttsx3.init()
-        engine.setProperty('rate', 150)
+    def _set_playing(self, v: bool):
+        with self._lock:
+            self._is_playing = v
 
-        while True:
-            # 1. Block until an item is available
-            first_text = self._queue.get()
-            
-            # 2. Mark as busy and pause microphone
-            self._is_speaking_event.set()
+    def is_playing(self):
+        """Returns True if audio is playing or if queue is not empty."""
+        with self._lock:
+            return self._is_playing or not self._queue.empty()
+
+    def _normalize_for_piper(self, text: str) -> str:
+        """Optimizes punctuation for better TTS flow."""
+        text = re.sub(r"[。！？]", lambda m: m.group(0) + "\n", text)  # Newline after sentence end
+        text = re.sub(r"[，、]", " ", text)  # Pause for commas
+        text = re.sub(r"\n{2,}", "\n", text)  # Remove excessive newlines
+        return text.strip()
+
+    def _speak_one(self, text: str):
+        """Generates WAV with Piper and plays it via aplay."""
+        text = self._normalize_for_piper(text)
+
+        # Create a temp file for the audio
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav_path = f.name
+
+        try:
+            # Pause microphone to prevent hearing itself
             if self.microphone:
                 self.microphone.pause()
 
-            try:
-                # Process the first item
-                self._speak_one(engine, first_text)
+            self._set_playing(True)
 
-                # 3. Drain the rest of the queue to keep mic paused between sentences
-                while not self._queue.empty():
-                    try:
-                        next_text = self._queue.get_nowait()
-                        self._speak_one(engine, next_text)
-                    except queue.Empty:
-                        break
-            finally:
-                # 4. Resume microphone and clear busy flag
-                if self.microphone:
-                    self.microphone.resume()
-                self._is_speaking_event.clear()
+            # 1. Generate Audio (Piper)
+            cmd = [
+                self.piper_bin,
+                "-m", self.model_path,
+                "-f", wav_path,
+                "--sentence-silence", str(self.sentence_silence),
+                "--volume", str(self.volume),
+                "--noise-scale", "0.6",
+                "--noise-w-scale", "0.6",
+            ]
 
-    def _speak_one(self, engine, text):
-        try:
-            # print(f"🗣️ Speaking: {text}") 
-            engine.say(text)
-            engine.runAndWait()
+            # print(f"🗣️ Piper generating: {text[:20]}...")
+            r = subprocess.run(
+                cmd,
+                input=text.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            if r.returncode != 0:
+                print("❌ Piper Failed:", r.stderr.decode("utf-8", errors="ignore"))
+                return
+
+            if not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+                print("❌ Generated WAV is empty.")
+                return
+
+            # 2. Play Audio (aplay)
+            r2 = subprocess.run(
+                ["aplay", "-q", wav_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if r2.returncode != 0:
+                print("❌ aplay Failed:", r2.stderr.decode("utf-8", errors="ignore"))
+
         except Exception as e:
-            print(f"Error in speech generation: {e}")
+            print(f"Error in speech loop: {e}")
         finally:
-            self._queue.task_done()
+            self._set_playing(False)
+            if self.microphone:
+                self.microphone.resume()
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+
+    def _play_worker(self):
+        """Worker loop that pulls text from queue and speaks it."""
+        while True:
+            text = self._queue.get()
+            if text is None:
+                self._queue.task_done()
+                return
+            try:
+                self._speak_one(text)
+            finally:
+                self._queue.task_done()
 
     def play_text(self, text):
+        """Interface used by the main app to queue text."""
         if isinstance(text, list):
             for t in text:
-                self._queue.put(t)
+                if self._use_queue:
+                    self._queue.put(t)
+                else:
+                    self._speak_one(t) # Blocking fallback
         else:
-            self._queue.put(text)
+            if self._use_queue:
+                self._queue.put(text)
+            else:
+                threading.Thread(target=self._speak_one, args=(text,), daemon=True).start()
 
-    def is_playing(self):
-        return self._is_speaking_event.is_set() or not self._queue.empty()
+    def close(self):
+        if self._use_queue:
+            self._queue.put(None)
 
 # --- MICROPHONE CLASS ---
 
@@ -162,7 +240,7 @@ class Microphone:
                 # 'listen' keeps the stream open
                 with ignore_stderr():
                     with mic as source:
-                        audio = recognizer.listen(source, timeout=None, phrase_time_limit=5)
+                        audio = recognizer.listen(source, timeout=None, phrase_time_limit=10)
 
                 # 4. Recognition (No need to silence, this is network/CPU only)
                 try:
@@ -183,21 +261,36 @@ class Microphone:
         return not self._queue.empty()
 
     def read_text(self):
+        messages = []
         try:
-            return self._queue.get_nowait()
+            # Loop strictly to drain the queue
+            while True:
+                # get_nowait raises queue.Empty immediately if nothing is there
+                msg = self._queue.get_nowait()
+                messages.append(msg)
+                self._queue.task_done()
         except queue.Empty:
-            return ""
+            pass # Queue is empty, loop finished
+            
+        # Join all separate phrases into one string (e.g. "Yes" + "I am ready")
+        return " ".join(messages)
 
 if __name__ == "__main__":
-    mic = Microphone()
 
     try:
-        print("Listening for speech... Press Ctrl+C to stop.")
-        while True:
-            if mic.has_text():
-                print("Recognized:", mic.read_text())
-            time.sleep(1)
+        speaker = Speaker(microphone=None)
+
+        print("🗣️ Speaking...")
+        speaker.play_text("測試成功，語音系統正常。")
+
+        # Wait for audio to finish
+        while speaker.is_playing():
+            time.sleep(0.1)
+
+        print("✅ Done.")
 
     except KeyboardInterrupt:
         print("Test interrupted. Stopped listening.")
         mic._stop_event.set()
+
+
