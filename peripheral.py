@@ -1,7 +1,6 @@
 import threading
 import queue
 import pyttsx3
-#from picamera2 import Picamera2
 import base64, time
 import speech_recognition as sr
 import os
@@ -10,7 +9,7 @@ from contextlib import contextmanager
 import re, tempfile, subprocess
 
 # --- CAMERA CLASS ---
-class Camera:
+class MockCamera:
     def __init__(self):
         # Ensure you have a file named 'images.jfif' in the same directory
         self.image_path = "images.jfif"
@@ -24,6 +23,41 @@ class Camera:
         except FileNotFoundError:
             print(f"[Mock Camera] Error: '{self.image_path}' not found. Please place an image file in the directory.")
             return None
+
+"""
+from picamera2 import Picamera2
+
+class RPiCamera:
+    def __init__(self):
+        self.picam2 = Picamera2()
+
+        # Configure a still or preview configuration
+        camera_config = self.picam2.create_still_configuration()
+        self.picam2.configure(camera_config)
+
+        # Start the camera once and keep it running
+        self.picam2.start()
+        time.sleep(2.0)  # Warm-up time for AE/AWB
+
+    def __del__(self):
+        try:
+            self.picam2.stop()
+            print("Camera stopped.")
+        except Exception:
+            pass
+
+    def capture(self) -> str:
+        filename = "temp_capture.jpg"
+        
+        # Capture to file
+        self.picam2.capture_file(filename)
+        print(f"Captured {filename}")
+
+        # Read file and encode to base64
+        with open(filename, "rb") as f:
+            img_bytes = f.read()
+            return base64.b64encode(img_bytes).decode("utf-8")
+"""
 
 class Speaker:
     def __init__(

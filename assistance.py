@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 # Import the interface provided by your teammates
 #from peripheral_test import Camera, Speaker, Microphone
-from peripheral import Camera, Speaker, Microphone
+from peripheral import MockCamera, Speaker, Microphone
 
 # Load API Key
 load_dotenv()
@@ -29,7 +29,7 @@ class CookingAssistant:
         
         # --- Hardware Initialization ---
         self.speaker = Speaker()
-        self.camera = Camera()
+        self.camera = MockCamera()
         self.mic = Microphone()
         
         # --- State Definitions ---
