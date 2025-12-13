@@ -113,6 +113,51 @@ class CookingAssistant:
             except Exception:
                 pass
 
+    def _prune_active_cooking_images(self):
+        """
+        Amnesia Strategy: Keeps only the latest 3 images from the ACTIVE_COOKING state.
+        Removes the 'image_url' field from older messages to save tokens.
+        """
+        active_cooking_image_indices = []
+
+        # 1. Identify all User messages that have images AND are in ACTIVE_COOKING
+        for i, msg in enumerate(self.history):
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                # Check if this message has an image
+                has_image = any(item.get("type") == "image_url" for item in msg["content"])
+                
+                if has_image:
+                    # Check if the state context was ACTIVE_COOKING
+                    try:
+                        # Extract the text part which contains the JSON context
+                        text_part = next(item for item in msg["content"] if item.get("type") == "text")
+                        context = json.loads(text_part["text"])
+                        
+                        if context.get("current_state") == "ACTIVE_COOKING":
+                            active_cooking_image_indices.append(i)
+                    except (StopIteration, json.JSONDecodeError, KeyError):
+                        continue
+
+        # 2. Prune if count > 3 (Keep the last 3)
+        if len(active_cooking_image_indices) > 3:
+            # Indices to prune: All except the last 3
+            indices_to_prune = active_cooking_image_indices[:-3]
+            
+            for idx in indices_to_prune:
+                # Rebuild content list EXCLUDING the image_url item
+                original_content = self.history[idx]["content"]
+                new_content = [item for item in original_content if item.get("type") != "image_url"]
+                
+                # Add a placeholder so the AI knows an image used to be there
+                new_content.append({
+                    "type": "text", 
+                    "text": "[System Note: Older image data stripped to save memory]"
+                })
+                
+                self.history[idx]["content"] = new_content
+                if self.debug:
+                    print(f"[System] Amnesia: Pruned old image at history index {idx}")
+
     def update_history(self, role, content):
         """
         Smart History Management.
@@ -121,10 +166,8 @@ class CookingAssistant:
             try:
                 content_json = json.loads(content)
                 status = content_json.get("status", "")
-                # Get speech output to ensure it is empty
                 speech = content_json.get("speech_output", "")
 
-                # Modified Condition: Only merge if status is MONITORING *AND* speech is empty
                 if status == "MONITORING_NO_CHANGE" and not speech and len(self.history) >= 2:
                     prev_assistant_msg = self.history[-2] 
                     if prev_assistant_msg["role"] == "assistant":
@@ -132,8 +175,6 @@ class CookingAssistant:
                             prev_json = json.loads(prev_assistant_msg["content"])
                             prev_status = prev_json.get("status", "")
                             
-                            # Check if previous was also a monitoring state (implies empty speech usually)
-                            # or if it was already a merged monitoring block
                             if prev_status == "MONITORING_NO_CHANGE" or "MONITORING_NO_CHANGE *" in prev_json.get("debug_note", ""):
                                 count = prev_json.get("monitor_count", 1) + 1
                                 content_json["monitor_count"] = count
@@ -143,29 +184,35 @@ class CookingAssistant:
                                 print(f"[System] Merging Monitor Log. Count: {count}")
                                 
                                 if len(self.history) >= 3:
-                                    del self.history[-3] # Remove old user msg
-                                    del self.history[-2] # Remove old assistant msg
+                                    del self.history[-3]
+                                    del self.history[-2]
                         except json.JSONDecodeError:
                             pass
             except json.JSONDecodeError:
                 pass
 
         self.history.append({"role": role, "content": content})
+        
+        # --- NEW: Trigger Amnesia Strategy ---
+        if role == "user":
+            self._prune_active_cooking_images()
+            
         self._save_history()
 
     def call_gpt_api(self, user_voice, image_base64=None):
         current_state_obj = self.states[self.current_state_name]
 
-        # --- SYSTEM PROMPT (UNCHANGED) ---
+        # --- SYSTEM PROMPT ---
         system_prompt = """
         You are a Smart Cooking Assistant.
 
         ### LANGUAGE PROTOCOL ###
         - CRITICAL: All content in "speech_output" MUST be in Traditional Chinese (Taiwan/繁體中文).
-        - Internal JSON values (status, next_state, timer_name) MUST remain in English.
+        - Internal JSON values (status, next_state, timer_name, thought_process) MUST remain in English.
         
         OUTPUT JSON FORMAT:
         {
+            "thought_process": "1. Analyze image (describe strictly what you see). 2. Compare to goal. 3. Formulate response.",
             "speech_output": "Text to speak (empty string if strictly monitoring with no update)",
             "status": "MONITORING_NO_CHANGE" | "INSTRUCTION_UPDATE" | "USER_INTERACTION",
             "next_state": "Exact string name of the next state",
@@ -178,11 +225,11 @@ class CookingAssistant:
         2. You MUST select 'next_state' ONLY from this list: {valid_next_states}.
         3. DO NOT invent new states. DO NOT switch state if the user did not agree.
 
-        ### VISUAL REASONING PROTOCOL ###
+        ### VISUAL REASONING PROTOCOL (Use 'thought_process' for this) ###
         When asked to judge the state of food (e.g., cut size, doneness):
-        1. FIRST, describe strictly what you see (e.g., "I see a whole fillet," or "I see large chunks").
+        1. FIRST, describe strictly what you see in the image (e.g., "I see a whole fillet," or "I see large chunks").
         2. THEN, compare it to the goal state.
-        3. ONLY THEN give your verdict.
+        3. ONLY THEN give your verdict in 'speech_output'.
 
         INSTRUCTIONS:
         
@@ -217,7 +264,7 @@ class CookingAssistant:
               ACTION: Explain the NEXT step. Set status="INSTRUCTION_UPDATE".
            3. CASE (User asks visual judgment question): 
               (e.g. "Is it small enough?", "Is this done?").
-              ACTION: You must STOP and look at the image.
+              ACTION: Check 'thought_process' logic.
               - If the food looks exactly the same as the raw ingredient: Say "It doesn't look diced yet. It looks like a whole piece."
               - If you can't see it clearly: Say "I can't see the salmon clearly. Can you bring it closer?"
               - Only say "Yes" if you clearly see distinct small pieces.
@@ -232,7 +279,7 @@ class CookingAssistant:
             "current_state": current_state_obj.name,
             "goal": current_state_obj.description,
             "valid_next_states": current_state_obj.valid_next_states,
-            "timestamp": datetime.now().isoformat(),  # --- MODIFICATION: Added Timestamp ---
+            "timestamp": datetime.now().isoformat(),
             "user_voice": user_voice,
             "image_provided": image_base64 is not None
         }
@@ -255,7 +302,7 @@ class CookingAssistant:
             "model": "gpt-4o",
             "messages": [{"role": "system", "content": system_prompt}] + self.history,
             "response_format": {"type": "json_object"},
-            "max_tokens": 300
+            "max_tokens": 500  # Increased to accommodate thought process
         }
 
         try:
@@ -345,11 +392,16 @@ class CookingAssistant:
             if not response: continue
 
             # --- PROCESS RESPONSE ---
+            thought = response.get("thought_process", "")
             speech = response.get("speech_output", "")
             status = response.get("status", "")
             next_state = response.get("next_state")
             timer_name = response.get("timer_name")
             timer_duration = response.get("timer_duration")
+
+            # Debug: Print Thought Process to Console
+            if thought:
+                print(f"💭 Thought: {thought}")
 
             if timer_name and timer_duration:
                 try:
